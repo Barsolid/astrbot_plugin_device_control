@@ -4,7 +4,7 @@ short_desc: 用自然语言控制周边设备（打印机/扬声器等），执�
 desc: 让机器人控制周边的设备（例如打印机、扬声器）。当用户提出需求时，机器人会先发起确认询问，只有在用户确认后才会真正调用设备完成任务。
 version: v0.1.0
 author: A3uracY
-repo: https://github.com/A3uracY/astrbot_plugin_device_control
+repo: https://github.com/Barsolid/astrbot_plugin_device_control
 astrbot_version: ">=4.5.1"
 support_platforms:
   - aiocqhttp
