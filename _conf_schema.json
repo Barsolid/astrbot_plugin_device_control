@@ -1,0 +1,42 @@
+{
+  "enable_printer": {
+    "description": "启用打印机设备",
+    "type": "bool",
+    "default": true,
+    "hint": "启用后可通过 /print、/printfile 或自然语言使用打印机"
+  },
+  "printer_name": {
+    "description": "目标打印机名称",
+    "type": "string",
+    "default": "",
+    "hint": "留空表示使用系统默认打印机。可在「设置 - 打印机和扫描仪」中查看准确名称"
+  },
+  "max_print_chars": {
+    "description": "单次打印文本的最大字符数",
+    "type": "int",
+    "default": 5000,
+    "hint": "超过该长度的文本会被拒绝，防止误打印超长内容"
+  },
+  "enable_speaker": {
+    "description": "启用扬声器设备（系统语音朗读）",
+    "type": "bool",
+    "default": true
+  },
+  "enable_llm_tools": {
+    "description": "启用 LLM 工具（让机器人能自动调用设备）",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后仅能通过 /print、/say 等指令使用"
+  },
+  "confirm_timeout": {
+    "description": "确认等待超时（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "dry_run": {
+    "description": "调试模式：不真正操作硬件，仅记录将要执行的动作",
+    "type": "bool",
+    "default": false,
+    "hint": "调试和编辑插件时建议打开，避免真的打印"
+  }
+}
