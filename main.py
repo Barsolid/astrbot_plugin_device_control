@@ -18,6 +18,7 @@
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,7 @@ from typing import Any
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, FunctionTool, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.astr_agent_context import AstrAgentContext
@@ -46,9 +48,19 @@ CONFIRM_WORDS = {
 
 #: 视为「取消」的回复
 CANCEL_WORDS = {
-    "取消", "否", "不", "不用", "算了", "放弃", "停止",
+    "取消", "否", "不", "不用", "不要", "算了", "放弃", "停止", "别",
     "no", "n", "cancel", "abort",
 }
+
+#: 注入给模型的系统提示：让模型自己判断是否需要使用周边设备，并先征求确认。
+DEVICE_HINT = (
+    "\n\n【周边设备能力】你连接了现实世界中的周边设备（如打印机、扬声器）。"
+    "当用户希望把内容输出到现实世界时（例如让你写一封信/便签/清单并打印出来、"
+    "把某段文字打印成纸、把某段文字用扬声器念出来），你应当调用 device_request 工具"
+    "来登记该操作。该工具不会立即执行，而是会先向用户发出确认询问；"
+    "只有用户确认后才会真正执行。请先用 device_list 了解可用设备与动作。"
+    "在用户确认之前，绝不要声称操作已经完成，也不要重复调用工具。"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -241,9 +253,10 @@ class DeviceRequestTool(FunctionTool[AstrAgentContext]):
 
     name: str = "device_request"
     description: str = (
-        "当用户想要使用周边设备（例如打印文件、朗读文本）时调用本工具。"
-        "本工具不会立即执行，而是登记操作并向用户发出确认询问；"
-        "只有用户回复「确认」后，插件才会真正执行。"
+        "把内容输出到现实世界的周边设备。当用户希望获得一份「实物」时调用本工具，"
+        "例如：让你写一封信/便签/清单并打印出来、把某段文字打印成纸、把某段文字用扬声器念出来。"
+        "调用时需自行创作或准备要输出的内容，并通过 text 参数传入（print_file 用 file_path）。"
+        "本工具不会立即执行，而是登记操作并向用户发出确认询问；只有用户确认后才会真正执行。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -358,6 +371,29 @@ class DeviceControlPlugin(Star):
         text = (event.message_str or "").strip()
         parts = text.split(maxsplit=1)
         return parts[1].strip() if len(parts) > 1 else ""
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        """去掉空白与常见标点，便于匹配确认/取消。"""
+        return re.sub(r"[\s，。！？!?、~,.…]+", "", (text or "").strip().lower())
+
+    def _is_cancel(self, text: str) -> bool:
+        n = self._normalize(text)
+        return len(n) <= 8 and any(w in n for w in CANCEL_WORDS)
+
+    def _is_confirm(self, text: str) -> bool:
+        n = self._normalize(text)
+        if not n:
+            return False
+        # 否定优先，避免「不确认」「先别打印」被误判为确认
+        if any(w in n for w in ("取消", "不", "别", "no", "not")):
+            return False
+        if n in CONFIRM_WORDS:
+            return True
+        # 允许「好的，打印吧」「可以 帮我打印」这类短句
+        return len(n) <= 8 and any(
+            w in n for w in ("确认", "确定", "打印", "可以", "好的", "执行", "同意", "帮我")
+        )
 
     def create_pending(
         self, event: AstrMessageEvent, device: str, action: str, params: dict
@@ -512,6 +548,22 @@ class DeviceControlPlugin(Star):
     # ------------------------------------------------------------------
     # 确认监听
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 让模型自行判断是否需要用设备（无需任何指令）
+    # ------------------------------------------------------------------
+    @filter.on_llm_request()
+    async def inject_device_hint(self, event: AstrMessageEvent, req: ProviderRequest):
+        """在每轮请求的 system prompt 中注入稳定的设备能力说明。"""
+        if not self.devices:
+            return
+        if req.system_prompt is None:
+            req.system_prompt = ""
+        if "【周边设备能力】" not in req.system_prompt:
+            req.system_prompt += DEVICE_HINT
+
+    # ------------------------------------------------------------------
+    # 确认监听
+    # ------------------------------------------------------------------
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def on_confirmation(self, event: AstrMessageEvent):
         """监听「确认 / 取消」，处理待确认操作。"""
@@ -526,15 +578,15 @@ class DeviceControlPlugin(Star):
             event.stop_event()
             return
 
-        word = (event.message_str or "").strip().lower()
-        if word in CONFIRM_WORDS:
+        raw = event.message_str or ""
+        if self._is_cancel(raw):
+            self.pending.pop(umo, None)
+            yield event.plain_result("👌 已取消该操作。")
+            event.stop_event()
+        elif self._is_confirm(raw):
             self.pending.pop(umo, None)
             result = await self._execute(pending)
             yield event.plain_result(result)
-            event.stop_event()
-        elif word in CANCEL_WORDS:
-            self.pending.pop(umo, None)
-            yield event.plain_result("👌 已取消该操作。")
             event.stop_event()
         # 其他内容不拦截，交给正常流程
 
