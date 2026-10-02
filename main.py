@@ -54,12 +54,16 @@ CANCEL_WORDS = {
 
 #: 注入给模型的系统提示：让模型自己判断是否需要使用周边设备，并先征求确认。
 DEVICE_HINT = (
-    "\n\n【周边设备能力】你连接了现实世界中的周边设备（如打印机、扬声器）。"
-    "当用户希望把内容输出到现实世界时（例如让你写一封信/便签/清单并打印出来、"
-    "把某段文字打印成纸、把某段文字用扬声器念出来），你应当调用 device_request 工具"
-    "来登记该操作。该工具不会立即执行，而是会先向用户发出确认询问；"
-    "只有用户确认后才会真正执行。请先用 device_list 了解可用设备与动作。"
-    "在用户确认之前，绝不要声称操作已经完成，也不要重复调用工具。"
+    "\n\n【周边设备能力（必须严格遵守）】\n"
+    "你可以控制现实世界中的设备：printer（打印机）、speaker（扬声器）。"
+    "可用 device_list 查看设备与动作。\n"
+    "要真正操作设备，你必须在本次回复中【实际调用 device_request 工具】。"
+    "只用文字说“已打印/已准备好/打印机在等指令”等，不会产生任何实际动作，是必须避免的错误。\n"
+    "当用户要求输出内容（打印/朗读），或要求“再打印一次/重新打印/没纸了再来一份”时：\n"
+    "  - 若用户给出了内容：调用 device_request，并传入完整内容。\n"
+    "  - 若用户只说重打、没给内容：调用 device_reprint_last 工具，重复上一次的内容。\n"
+    "调用工具后，工具会向用户发出确认询问；请简短告知用户查看确认消息，"
+    "不要重复调用工具，也不要在用户确认前声称已完成。"
 )
 
 
@@ -312,6 +316,39 @@ class DeviceRequestTool(FunctionTool[AstrAgentContext]):
         )
 
 
+@pydantic_dataclass(config=dict(arbitrary_types_allowed=True))
+class DeviceReprintTool(FunctionTool[AstrAgentContext]):
+    """重新输出上一次的内容（无需用户再提供内容）。"""
+
+    name: str = "device_reprint_last"
+    description: str = (
+        "重新输出（打印/朗读）上一次已经输出过的内容。"
+        "当用户说“再打印一次/重新打印/没纸了再来一份/再念一遍”，但没有提供新内容时调用本工具。"
+        "本工具会登记操作并向用户发出确认询问，用户确认后才真正执行。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        }
+    )
+    plugin: Any = Field(default=None)
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        event = context.context.event
+        prompt, err = self.plugin.create_reprint_pending(event)
+        if err:
+            return err
+        try:
+            await self.plugin.context.send_message(
+                event.unified_msg_origin, MessageChain().message(prompt)
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[device_control] 发送确认询问失败: {e}", exc_info=True)
+        return "已登记重新输出请求并向用户发出确认询问。请简短告知用户查看确认消息。"
+
+
 # ---------------------------------------------------------------------------
 # 插件主体
 # ---------------------------------------------------------------------------
@@ -327,6 +364,8 @@ class DeviceControlPlugin(Star):
         self.config = config
         #: umo -> PendingAction
         self.pending: dict[str, PendingAction] = {}
+        #: umo -> 上一次登记输出的内容（用于“重新打印”）
+        self.last_content: dict[str, dict] = {}
         self.devices: dict[str, DeviceBase] = {}
         self._setup_devices()
         self._register_tools()
@@ -350,8 +389,9 @@ class DeviceControlPlugin(Star):
             self.context.add_llm_tools(
                 DeviceListTool(plugin=self),
                 DeviceRequestTool(plugin=self),
+                DeviceReprintTool(plugin=self),
             )
-            logger.info("[device_control] LLM 工具已注册: device_list, device_request")
+            logger.info("[device_control] LLM 工具已注册: device_list, device_request, device_reprint_last")
         except Exception as e:  # noqa: BLE001
             logger.error(f"[device_control] 注册 LLM 工具失败: {e}", exc_info=True)
 
@@ -416,12 +456,29 @@ class DeviceControlPlugin(Star):
             created_at=time.time(),
             timeout=timeout,
         )
+        # 记住本次内容，方便用户之后“重新打印/再输出一次”
+        self.last_content[umo] = {
+            "device": device,
+            "action": action,
+            "params": dict(params),
+            "summary": summary,
+        }
         prompt = (
             f"⚠️ 即将执行设备操作：\n{summary}\n\n"
             f"请回复「确认」执行，或回复「取消」放弃（{timeout} 秒内有效）。"
         )
         logger.info(f"[device_control] 登记待确认操作 {umo}: {summary}")
         return prompt, ""
+
+    def create_reprint_pending(self, event: AstrMessageEvent) -> tuple[str, str]:
+        """重新登记上一次输出过的内容。返回 (确认提示, 错误)。"""
+        umo = event.unified_msg_origin
+        last = self.last_content.get(umo)
+        if not last:
+            return "", "❌ 没有找到上一次要输出的内容，请告诉我你想打印或朗读什么。"
+        return self.create_pending(
+            event, last["device"], last["action"], dict(last["params"])
+        )
 
     @staticmethod
     def _summarize(device: str, action: str, params: dict) -> str:
